@@ -19,6 +19,7 @@ from config import (
 )
 
 from spam_model import classify_parallel
+from data_logger import log_message_for_ml
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +177,11 @@ async def worker_loop(worker_id: int):
 async def process_message(entity, msg):
     text = msg.message or ""
     channel = entity.username or entity.title or "unknown"
+
+    # Логируем сообщение для сбора датасета (получаем heuristic_score)
+    from spam_rules import heuristic_spam_score
+    heuristic_score = heuristic_spam_score(text)
+    log_message_for_ml(text, heuristic_score, channel, msg.id)
 
     # Получаем все оценки параллельно
     logger.info("Начало классификации для %s/%s", channel, msg.id)
