@@ -18,7 +18,7 @@ from config import (
     QUEUE_MAXSIZE,
 )
 
-from spam_model import classify_parallel
+from classifier_multilabel import classify_multilabel
 from data_logger import log_message_for_ml
 
 logging.basicConfig(
@@ -102,126 +102,200 @@ async def poll_channels():
             try:
                 entity = await client.get_entity(ch)
                 last_id = last_ids.get(entity.id, 0)
-
-                logger.info(
-                    "POLL | %s | last_id=%s",
-                    entity.username,
-                    last_id
-                )
-
-                async for msg in client.iter_messages(
-                    entity,
-                    min_id=last_id,
-                    reverse=True
-                ):
-                    if not msg.message:
-                        continue
-
-                    msg_key = (entity.id, msg.id)
-
-                    if msg_key in processed_ids:
-                        logger.debug("DUPLICATE skip %s/%s", entity.username, msg.id)
-                        continue
-
-                    if message_queue.full():
-                        logger.warning("QUEUE FULL — skipping msg %s/%s", entity.username, msg.id)
-                        continue
-
-                    processed_ids.append(msg_key)
-                    await message_queue.put((entity, msg))
-                    last_ids[entity.id] = msg.id
-
-                    logger.info(
-                        "QUEUE + | %s/%s | size=%s",
-                        entity.username,
-                        msg.id,
-                        message_queue.qsize()
-                    )
-
+                
+                # Получаем новые сообщения
+                messages = await client.get_messages(entity, min_id=last_id, limit=10)
+                
+                if messages:
+                    # Обновляем last_id на максимальный ID из полученных сообщений
+                    new_last_id = max(msg.id for msg in messages)
+                    last_ids[entity.id] = new_last_id
+                    
+                    # Добавляем сообщения в очередь
+                    for msg in messages:
+                        if msg.id not in processed_ids:
+                            try:
+                                message_queue.put_nowait((entity, msg))
+                                processed_ids.append(msg.id)
+                            except Exception:
+                                logger.warning("Очередь переполнена, пропускаем сообщение %s/%s", ch, msg.id)
+                
+            except FloodWaitError as e:
+                logger.warning("FloodWait: ждем %d секунд", e.seconds)
+                await asyncio.sleep(e.seconds)
             except Exception:
-                logger.exception("Ошибка polling канала %s", ch)
-
-        logger.info("Polling sleep %s sec", CHECK_INTERVAL)
+                logger.exception("Ошибка при опросе канала %s", ch)
+        
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def worker_loop(worker_id: int):
-    logger.info("WORKER-%s started", worker_id)
-
-    while True:
-        entity, msg = await message_queue.get()
-
-        try:
-            logger.info(
-                "WORKER-%s | PROCESS %s/%s",
-                worker_id,
-                entity.username,
-                msg.id
-            )
-
-            await process_message(entity, msg)
-
-        except FloodWaitError as e:
-            logger.warning("WORKER-%s | FloodWait %s sec", worker_id, e.seconds)
-            await asyncio.sleep(e.seconds + 1)
-        except Exception:
-            logger.exception(
-                "WORKER-%s | ERROR msg_id=%s",
-                worker_id,
-                msg.id
-            )
-        finally:
-            message_queue.task_done()
-
-
 async def process_message(entity, msg):
+    """Обрабатывает одно сообщение: классифицирует и пересылает если нужно."""
+    channel = entity.username or str(entity.id)
     text = msg.message or ""
-    channel = entity.username or entity.title or "unknown"
-
-    # Логируем сообщение для сбора датасета (получаем heuristic_score)
-    from spam_rules import heuristic_spam_score
-    heuristic_score = heuristic_spam_score(text)
-    log_message_for_ml(text, heuristic_score, channel, msg.id)
-
-    # Получаем все оценки параллельно
-    logger.info("Начало классификации для %s/%s", channel, msg.id)
-    results = await classify_parallel(text)
     
-    # Если результатов нет, используем минимальную эвристику напрямую
-    if not results:
-        logger.warning("⚠ Не получено оценок от основных методов, используем прямую эвристику для %s/%s", channel, msg.id)
-        try:
-            from spam_rules import heuristic_spam_score
-            score = heuristic_spam_score(text)
-            # Нормализуем score в диапазон 0-1 (эвристика возвращает обычно 0-30)
-            normalized_score = min(1.0, score / 10.0) if score > 1.0 else score
-            results = [{
-                "method": "fallback",
-                "score": normalized_score,
-                "reason": "heuristic_emergency"
-            }]
-            logger.info("  ✓ fallback (emergency): score=%.3f, raw_score=%.1f", normalized_score, score)
-        except Exception as e:
-            logger.error("❌ Критическая ошибка: не удалось использовать даже эвристику: %s", str(e))
-            # В крайнем случае используем нейтральную оценку
-            results = [{
-                "method": "fallback",
-                "score": 0.5,
-                "reason": f"critical_error: {str(e)}"
-            }]
+    # Пропускаем сообщения без текста (только медиа)
+    if not text or not text.strip():
+        logger.debug("Пропуск сообщения %s/%s: нет текста (только медиа)", channel, msg.id)
+        return
 
-    # Вычисляем средний score
-    scores = [r["score"] for r in results]
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    is_spam = avg_score >= 0.6
+    # Параллельная классификация: эвристика и BERT работают одновременно
+    logger.info("Начало параллельной классификации для %s/%s", channel, msg.id)
+    
+    async def get_heuristic_result():
+        """Получает мультиметочную оценку от эвристики."""
+        try:
+            from spam_rules_multilabel import heuristic_multilabel_score, heuristic_multilabel_predict
+            scores = heuristic_multilabel_score(text)
+            predictions = heuristic_multilabel_predict(text)
+            
+            # Вычисляем общую оценку (максимум из всех категорий)
+            max_score = max(scores.values())
+            is_spam = any(predictions.values())
+            
+            return {
+                "method": "heuristics",
+                "scores": scores,
+                "predictions": predictions,
+                "score": max_score,
+                "is_spam": is_spam,
+                "reason": "heuristics_multilabel"
+            }
+        except Exception as e:
+            logger.exception("Ошибка эвристики")
+            return {
+                "method": "heuristics",
+                "scores": {"ads": 0.0, "crypto": 0.0, "scam": 0.0, "casino": 0.0},
+                "predictions": {"ads": 0, "crypto": 0, "scam": 0, "casino": 0},
+                "score": 0.5,
+                "is_spam": False,
+                "reason": f"error: {str(e)}"
+            }
+    
+    async def get_bert_result():
+        """Получает мультиметочную оценку от BERT."""
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, classify_multilabel, text)
+            
+            # Вычисляем общую оценку (максимум из всех категорий)
+            max_score = max(result["scores"].values())
+            is_spam = any(result["predictions"].values())
+            
+            return {
+                "method": "bert",
+                "scores": result["scores"],
+                "predictions": result["predictions"],
+                "score": max_score,
+                "is_spam": is_spam,
+                "reason": "bert_multilabel",
+                "methods_used": result["methods"]
+            }
+        except Exception as e:
+            logger.exception("Ошибка BERT")
+            # Fallback на эвристику
+            try:
+                from spam_rules_multilabel import heuristic_multilabel_score, heuristic_multilabel_predict
+                scores = heuristic_multilabel_score(text)
+                predictions = heuristic_multilabel_predict(text)
+                max_score = max(scores.values())
+                is_spam = any(predictions.values())
+                return {
+                    "method": "bert",
+                    "scores": scores,
+                    "predictions": predictions,
+                    "score": max_score,
+                    "is_spam": is_spam,
+                    "reason": f"bert_error_fallback_heuristic: {str(e)}"
+                }
+            except Exception as e2:
+                return {
+                    "method": "bert",
+                    "scores": {"ads": 0.0, "crypto": 0.0, "scam": 0.0, "casino": 0.0},
+                    "predictions": {"ads": 0, "crypto": 0, "scam": 0, "casino": 0},
+                    "score": 0.5,
+                    "is_spam": False,
+                    "reason": f"critical_error: {str(e2)}"
+                }
+    
+    # Запускаем оба метода параллельно
+    heuristic_task = asyncio.create_task(get_heuristic_result())
+    bert_task = asyncio.create_task(get_bert_result())
+    
+    # Ждем завершения всех задач
+    heuristic_result, bert_result = await asyncio.gather(
+        heuristic_task, bert_task
+    )
+    
+    # Логируем сообщение для сбора датасета (используем общий score)
+    log_message_for_ml(text, heuristic_result["score"] * 10.0, channel, msg.id)
+    
+    # Объединяем результаты: берем среднее для каждой категории
+    final_scores = {}
+    final_predictions = {}
+    for category in ["ads", "crypto", "scam", "casino"]:
+        h_score = heuristic_result["scores"].get(category, 0.0)
+        b_score = bert_result["scores"].get(category, 0.0)
+        final_scores[category] = (h_score + b_score) / 2.0 if (h_score > 0 or b_score > 0) else 0.0
+        # Предсказание: если хотя бы один метод предсказал 1, то итог = 1
+        final_predictions[category] = 1 if (
+            heuristic_result["predictions"].get(category, 0) == 1 or 
+            bert_result["predictions"].get(category, 0) == 1
+        ) else 0
+    
+    # Общая оценка и решение
+    max_score = max(final_scores.values())
+    is_spam = any(final_predictions.values())
 
     # Детальное логирование всех результатов
     logger.info("=" * 60)
-    logger.info("РЕЗУЛЬТАТЫ КЛАССИФИКАЦИИ | %s/%s", channel, msg.id)
-    logger.info("  Всего методов: %d", len(results))
-    for result in sorted(results, key=lambda x: x["method"]):
-        logger.info("  • %s: score=%.3f (%s)", result["method"], result["score"], result["reason"])
-    logger.info("  Средний score: %.3f | Итог: %s", avg_score, "СПАМ" if is_spam else "ОК")
+    logger.info("РЕЗУЛЬТАТЫ МУЛЬТИМЕТОЧНОЙ КЛАССИФИКАЦИИ | %s/%s", channel, msg.id)
+    
+    # Логируем эвристику
+    logger.info("  • Эвристика:")
+    logger.info("      Оценки: ads=%.3f, crypto=%.3f, scam=%.3f, casino=%.3f",
+                heuristic_result["scores"]["ads"],
+                heuristic_result["scores"]["crypto"],
+                heuristic_result["scores"]["scam"],
+                heuristic_result["scores"]["casino"])
+    logger.info("      Предсказания: ads=%d, crypto=%d, scam=%d, casino=%d",
+                heuristic_result["predictions"]["ads"],
+                heuristic_result["predictions"]["crypto"],
+                heuristic_result["predictions"]["scam"],
+                heuristic_result["predictions"]["casino"])
+    
+    # Логируем BERT
+    bert_reason = bert_result.get("reason", "")
+    if "fallback" in bert_reason or "error" in bert_reason:
+        logger.info("  • BERT: (%s)", bert_reason)
+    else:
+        logger.info("  • BERT:")
+        logger.info("      Оценки: ads=%.3f, crypto=%.3f, scam=%.3f, casino=%.3f",
+                    bert_result["scores"]["ads"],
+                    bert_result["scores"]["crypto"],
+                    bert_result["scores"]["scam"],
+                    bert_result["scores"]["casino"])
+        logger.info("      Предсказания: ads=%d, crypto=%d, scam=%d, casino=%d",
+                    bert_result["predictions"]["ads"],
+                    bert_result["predictions"]["crypto"],
+                    bert_result["predictions"]["scam"],
+                    bert_result["predictions"]["casino"])
+        if "methods_used" in bert_result:
+            logger.info("      Методы: %s", bert_result["methods_used"])
+    
+    # Логируем итоговые результаты
+    logger.info("  • ИТОГО (объединенные):")
+    logger.info("      Оценки: ads=%.3f, crypto=%.3f, scam=%.3f, casino=%.3f",
+                final_scores["ads"],
+                final_scores["crypto"],
+                final_scores["scam"],
+                final_scores["casino"])
+    logger.info("      Предсказания: ads=%d, crypto=%d, scam=%d, casino=%d",
+                final_predictions["ads"],
+                final_predictions["crypto"],
+                final_predictions["scam"],
+                final_predictions["casino"])
+    logger.info("      Общая оценка: %.3f | %s", max_score, "СПАМ" if is_spam else "ОК")
     logger.info("=" * 60)
 
     if not TARGET_ENTITY:
@@ -240,58 +314,94 @@ async def process_message(entity, msg):
         url = f"https://t.me/{entity.username}/{msg.id}"
         buttons = [Button.url("🔗 Открыть пост", url)]
 
-    flag = "⚠️ ВОЗМОЖНО СПАМ" if is_spam else "✅ вероятно ок"
+    flag = "⚠️ ВОЗМОЖНО СПАМ" if is_spam else "✅ок"
     
-    # Сортируем результаты по методу для единообразия
-    results_sorted = sorted(results, key=lambda x: x["method"])
-    
-    # Формируем информацию о всех оценках
-    evaluations = []
-    method_names = {
-        "llama_cli": "🤖 Qwen (llama-cli)",
-        "llama_cpp": "🤖 Qwen (llama-cpp-python)",
-        "transformers": "🤖 Qwen (transformers)",
-        "fallback": "📊 Fallback (эвристика/BERT)"
+    # Формируем информацию о категориях
+    categories_info = []
+    category_emojis = {
+        "ads": "📢",
+        "crypto": "₿",
+        "scam": "⚠️",
+        "casino": "🎰"
     }
     
-    for result in results_sorted:
-        method = result["method"]
-        score = result["score"]
-        reason = result.get("reason", "")
-        method_display = method_names.get(method, method)
-        result_text = "🔴 СПАМ" if score >= 0.6 else "🟢 НОРМ"
-        evaluations.append(f"{method_display}\n  {result_text} | score={score:.3f}")
+    for category in ["ads", "crypto", "scam", "casino"]:
+        if final_predictions[category] == 1:
+            emoji = category_emojis.get(category, "•")
+            score = final_scores[category]
+            categories_info.append(f"{emoji} {category.upper()}: {score:.2f}")
+    
+    categories_text = "\n".join(categories_info) if categories_info else "Нет категорий"
+    
+    # Формируем информацию о методах
+    evaluations = []
+    
+    # 1. Эвристика
+    heuristic_spam_text = "🔴 СПАМ" if heuristic_result["is_spam"] else "🟢 НОРМ"
+    evaluations.append(
+        f"📊 Эвристика\n"
+        f"  {heuristic_spam_text} | score={heuristic_result['score']:.3f}"
+    )
+    
+    # 2. BERT
+    bert_spam_text = "🔴 СПАМ" if bert_result["is_spam"] else "🟢 НОРМ"
+    bert_reason = bert_result.get("reason", "")
+    if "fallback" in bert_reason or "error" in bert_reason:
+        evaluations.append(
+            f"🤖 BERT ({bert_reason[:30]})\n"
+            f"  {bert_spam_text} | score={bert_result['score']:.3f}"
+        )
+    else:
+        evaluations.append(
+            f"🤖 BERT\n"
+            f"  {bert_spam_text} | score={bert_result['score']:.3f}"
+        )
     
     evaluations_text = "\n\n".join(evaluations)
     
-    comment = (
+    # Подсчитываем количество активных методов
+    active_methods_count = 2  # Эвристика и BERT
+    
+    message_text = (
         f"{flag}\n\n"
-        f"📊 РЕЗУЛЬТАТЫ ВСЕХ МЕТОДОВ ({len(results)}):\n\n"
+        f"📊 РЕЗУЛЬТАТЫ КЛАССИФИКАЦИИ ({active_methods_count} методов):\n\n"
         f"{evaluations_text}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Средний score: {avg_score:.3f}\n"
-        f"🎯 Итоговый вердикт: {'🔴 СПАМ' if is_spam else '🟢 НОРМ'}\n\n"
-        f"📺 Канал: {channel}\n"
-        f"🆔 ID: {msg.id}"
+        f"🏷️ КАТЕГОРИИ:\n{categories_text}\n\n"
+        f"📝 Исходный текст:\n{text[:200]}{'...' if len(text) > 200 else ''}"
     )
-
+    
     await client.send_message(
         TARGET_ENTITY,
-        comment,
+        message_text,
         buttons=buttons
     )
 
 
+async def worker():
+    """Воркер для обработки сообщений из очереди."""
+    while True:
+        try:
+            entity, msg = await message_queue.get()
+            await process_message(entity, msg)
+            message_queue.task_done()
+        except Exception:
+            logger.exception("Ошибка в воркере")
+
+
 async def main():
     await client.start()
-    logger.info("Telegram client started")
-
+    logger.info("Бот запущен")
+    
     await resolve_target_entity()
-
-    for i in range(WORKERS):
-        asyncio.create_task(worker_loop(i + 1))
-
-    await poll_channels()
+    
+    # Запускаем воркеры
+    workers = [asyncio.create_task(worker()) for _ in range(WORKERS)]
+    
+    # Запускаем опрос каналов
+    poll_task = asyncio.create_task(poll_channels())
+    
+    # Ждем завершения (никогда не завершится, но это нормально)
+    await asyncio.gather(poll_task, *workers)
 
 
 if __name__ == "__main__":

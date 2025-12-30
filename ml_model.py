@@ -1,8 +1,14 @@
 """ML классификатор спама на основе TF-IDF + Logistic Regression."""
-import joblib
 from pathlib import Path
 from typing import Optional
 import logging
+
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+    joblib = None
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,11 @@ class SpamMLClassifier:
     
     def _load_model(self):
         """Загружает обученную модель."""
+        if not HAS_JOBLIB:
+            logger.warning("joblib не установлен. Установите: pip install joblib")
+            self.model = None
+            return
+        
         if not self.model_path.exists():
             logger.warning(f"ML модель не найдена: {self.model_path}")
             logger.warning("Обучите модель: python train_ml.py")

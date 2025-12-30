@@ -70,3 +70,8 @@ logs/
 *.tmp
 *.temp
 Untitled
+
+# Old/unused files
+*.old
+*TEST*.py
+download_model.py

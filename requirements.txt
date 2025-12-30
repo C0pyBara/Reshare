@@ -1,7 +1,5 @@
 telethon>=1.28.0
 python-dotenv>=1.0.0
-huggingface_hub>=0.24.0
-llama-cpp-python>=0.2.0
 transformers>=4.30.0
 torch>=2.0.0
 scikit-learn>=1.0.0
