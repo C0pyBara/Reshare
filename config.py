@@ -52,8 +52,6 @@ CHECK_INTERVAL = 300  # 5 минут
 WORKERS = 3
 QUEUE_MAXSIZE = 1000
 
-# Конфигурация моделей для classifier.py
+# Конфигурация моделей для classifier_multilabel.py
 RUBERT_MODEL = 'cointegrated/rubert-tiny2'
 USE_RUBERT = True
-USE_QWEN = False  # Отключено, используем Qwen3-8B через spam_model.py
-QWEN_MODEL = 'Qwen/Qwen2.5-0.5B-Instruct'  # Fallback модель (не используется, если USE_QWEN=False)
