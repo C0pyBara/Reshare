@@ -171,20 +171,58 @@ def _analyze_structure(text: str) -> Dict[str, float]:
     """Анализирует структурные признаки текста."""
     text_lower = text.lower()
     
-    # Количество ссылок
-    links_count = len(re.findall(r"https?://|t\.me/", text_lower))
+    # Количество ссылок (расширенный поиск)
+    url_patterns = [
+        r"https?://\S+",
+        r"t\.me/\S+",
+        r"bit\.ly/\S+",
+        r"goo\.gl/\S+",
+        r"clck\.ru/\S+",
+        r"short\.link/\S+"
+    ]
+    links_count = sum(len(re.findall(pattern, text_lower)) for pattern in url_patterns)
+    
+    # Телефонные номера (исправленные регулярные выражения)
+    phone_patterns = [
+        r"\+?\d[\d\s\-()]{6,}\d",
+        r"\+7[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}",
+        r"\+380[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}",
+        r"\+?\d{1,3}[\s\-]?\(?\d{3,4}\)?[\s\-]?\d{2,3}[\s\-]?\d{2}[\s\-]?\d{2}"
+    ]
+    phones_count = sum(len(re.findall(pattern, text)) for pattern in phone_patterns)
     
     # Доля заглавных букв
     upper_ratio = sum(1 for c in text if c.isupper()) / len(text) if len(text) > 0 else 0
     
-    # Плотность эмодзи
-    emoji_count = len(re.findall(r'[^\w\s,.!?]', text))
+    # Плотность эмодзи (расширенный поиск)
+    emoji_patterns = [
+        r'[🔥💥🎁✅⭐️🎉💰💎🚀]',  # Популярные рекламные эмодзи
+        r'[^\w\s,.!?]'  # Любые не-буквенные символы
+    ]
+    emoji_count = sum(len(re.findall(pattern, text)) for pattern in emoji_patterns)
     emoji_density = emoji_count / len(text) if len(text) > 0 else 0
+    
+    # Восклицательные знаки
+    exclamation_count = text.count('!')
+    exclamation_density = exclamation_count / len(text) if len(text) > 0 else 0
+    
+    # Проценты и валюты
+    percent_count = len(re.findall(r'\b\d{1,3}%', text))
+    currency_count = len(re.findall(r'[₽$₴]|\b(руб|грн)\.?', text_lower))
+    
+    # Повтор ключевых слов
+    ad_keywords = ['скидка', 'акция', 'промокод', 'бонус', 'бесплатно']
+    keyword_repeats = sum(text_lower.count(keyword) for keyword in ad_keywords if keyword in text_lower)
     
     return {
         "links": links_count,
+        "phones": phones_count,
         "caps_ratio": upper_ratio,
-        "emoji_density": emoji_density
+        "emoji_density": emoji_density,
+        "exclamation_density": exclamation_density,
+        "percent_count": percent_count,
+        "currency_count": currency_count,
+        "keyword_repeats": keyword_repeats
     }
 
 
@@ -221,9 +259,8 @@ def heuristic_multilabel_score(text: str) -> Dict[str, float]:
         scores["ads"] += structure["links"] * 2.5
     
     # Телефонные номера - признак рекламы
-    phones_count = structure.get("phones", 0)
-    if phones_count > 0:
-        scores["ads"] += phones_count * 2.0
+    if structure.get("phones", 0) > 0:
+        scores["ads"] += structure["phones"] * 2.0
     
     # Капс - признак рекламы и скама
     if structure["caps_ratio"] > 0.3 and len(text) > 20:
@@ -239,17 +276,14 @@ def heuristic_multilabel_score(text: str) -> Dict[str, float]:
         scores["ads"] += 1.0
     
     # Проценты и валюты - признак рекламы
-    percent_count = structure.get("percent_count", 0)
-    currency_count = structure.get("currency_count", 0)
-    if percent_count > 0:
-        scores["ads"] += percent_count * 1.0
-    if currency_count > 0:
-        scores["ads"] += currency_count * 1.0
+    if structure.get("percent_count", 0) > 0:
+        scores["ads"] += structure["percent_count"] * 1.0
+    if structure.get("currency_count", 0) > 0:
+        scores["ads"] += structure["currency_count"] * 1.0
     
     # Повтор ключевых слов - признак рекламы
-    keyword_repeats = structure.get("keyword_repeats", 0)
-    if keyword_repeats > 2:
-        scores["ads"] += (keyword_repeats - 2) * 0.5
+    if structure.get("keyword_repeats", 0) > 2:
+        scores["ads"] += (structure["keyword_repeats"] - 2) * 0.5
     
     # Нормализуем все оценки в диапазон 0.0 - 1.0
     # Используем сигмоиду для нормализации
