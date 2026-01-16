@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import re
 import sys
 from asyncio import Queue
 from collections import deque
 
 from telethon import TelegramClient, Button
 from telethon.errors import FloodWaitError
+from telethon.tl.types import MessageEntityUrl, MessageEntityTextUrl, MessageMediaWebPage, MessageMediaEmpty
 
 from config import (
     API_ID,
@@ -43,6 +45,236 @@ TARGET_ENTITY = None
 
 PROCESSED_CACHE_SIZE = 10_000
 processed_ids = deque(maxlen=PROCESSED_CACHE_SIZE)
+
+TARGET_GROUP_ID = -1003172147499  # ID группы для публикации
+
+
+def can_send_as_file(media):
+    """
+    Проверяет, можно ли отправить медиа как файл.
+    Некоторые типы медиа (например, MessageMediaWebPage) нельзя отправить как файл.
+    """
+    if not media:
+        return False
+    
+    # MessageMediaWebPage и MessageMediaEmpty нельзя отправить как файл
+    if isinstance(media, (MessageMediaWebPage, MessageMediaEmpty)):
+        return False
+    
+    # Остальные типы медиа (фото, документы, видео и т.д.) можно отправить
+    return True
+
+
+def utf16_len(text):
+    """Подсчитывает длину строки в UTF-16 code units."""
+    return len(text.encode('utf-16-le')) // 2
+
+
+def utf16_to_python_pos(text, utf16_offset):
+    """Конвертирует UTF-16 offset в позицию в Python строке."""
+    if utf16_offset <= 0:
+        return 0
+    
+    # Итерируемся по символам и подсчитываем UTF-16 единицы
+    utf16_count = 0
+    for i, char in enumerate(text):
+        # Каждый символ занимает 1 или 2 UTF-16 code units (surrogate pairs)
+        char_utf16_len = len(char.encode('utf-16-le')) // 2
+        if utf16_count + char_utf16_len > utf16_offset:
+            return i
+        utf16_count += char_utf16_len
+        if utf16_count >= utf16_offset:
+            return i + 1
+    
+    return len(text)
+
+
+def python_to_utf16_offset(text, python_pos):
+    """Конвертирует позицию в Python строке в UTF-16 offset."""
+    if python_pos >= len(text):
+        return utf16_len(text)
+    
+    substring = text[:python_pos]
+    return utf16_len(substring)
+
+
+def remove_hyperlinks(text, entities):
+    """
+    Удаляет все гиперссылки из текста сообщения.
+    Возвращает очищенный текст без ссылок.
+    entities используют UTF-16 offsets, поэтому нужно правильно конвертировать.
+    """
+    if not entities:
+        return text
+    
+    # Создаем список диапазонов ссылок в UTF-16 offsets
+    link_ranges_utf16 = []
+    for entity in entities:
+        if isinstance(entity, (MessageEntityUrl, MessageEntityTextUrl)):
+            link_ranges_utf16.append((entity.offset, entity.offset + entity.length))
+    
+    if not link_ranges_utf16:
+        return text
+    
+    # Сортируем по начальной позиции
+    link_ranges_utf16.sort(key=lambda x: x[0])
+    
+    # Удаляем перекрывающиеся диапазоны
+    merged_ranges_utf16 = []
+    for start, end in link_ranges_utf16:
+        if merged_ranges_utf16 and start <= merged_ranges_utf16[-1][1]:
+            # Перекрывается с предыдущим диапазоном
+            merged_ranges_utf16[-1] = (merged_ranges_utf16[-1][0], max(merged_ranges_utf16[-1][1], end))
+        else:
+            merged_ranges_utf16.append((start, end))
+    
+    # Конвертируем UTF-16 offsets в позиции Python строки
+    link_ranges_python = []
+    for start_utf16, end_utf16 in merged_ranges_utf16:
+        start_python = utf16_to_python_pos(text, start_utf16)
+        end_python = utf16_to_python_pos(text, end_utf16)
+        link_ranges_python.append((start_python, end_python))
+    
+    # Строим новый текст, исключая ссылки
+    result = []
+    last_pos = 0
+    
+    for start, end in link_ranges_python:
+        # Добавляем текст до ссылки
+        if start > last_pos:
+            result.append(text[last_pos:start])
+        last_pos = end
+    
+    # Добавляем оставшийся текст после последней ссылки
+    if last_pos < len(text):
+        result.append(text[last_pos:])
+    
+    return ''.join(result).strip()
+
+
+def clean_text_artifacts(text):
+    """
+    Удаляет артефакты из текста после удаления ссылок:
+    - одиночные символы-разделители (|, -, • и т.д.)
+    - множественные пробелы
+    - пустые строки
+    - строки, состоящие только из разделителей
+    """
+    if not text:
+        return text
+    
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    # Разделители, которые нужно удалять если они стоят отдельно
+    separators = ['|', '•', '-', '—', '–', '·', '▪', '▫']
+    
+    for line in lines:
+        # Удаляем пробелы в начале и конце строки
+        line = line.strip()
+        
+        # Пропускаем пустые строки
+        if not line:
+            continue
+        
+        # Пропускаем строки, состоящие только из разделителей и пробелов
+        if all(c in separators + [' '] for c in line):
+            continue
+        
+        # Удаляем одиночные разделители в начале и конце строки
+        # Но оставляем их если они часть текста
+        # Удаляем разделители, которые стоят отдельно (окружены пробелами или в начале/конце)
+        
+        # Удаляем разделители в начале строки (с пробелами после или без)
+        line = re.sub(r'^[' + re.escape('|•-—–·▪▫') + r']+\s*', '', line)
+        # Удаляем разделители в конце строки (с пробелами перед или без)
+        line = re.sub(r'\s*[' + re.escape('|•-—–·▪▫') + r']+$', '', line)
+        # Удаляем разделители, окруженные пробелами с обеих сторон
+        line = re.sub(r'\s+[' + re.escape('|•-—–·▪▫') + r']+\s+', ' ', line)
+        # Удаляем разделители с пробелом только слева (перед пробелом или концом строки)
+        line = re.sub(r'\s+[' + re.escape('|•-—–·▪▫') + r']+(?=\s|$)', '', line)
+        # Удаляем разделители с пробелом только справа (после пробела или в начале строки)
+        # Используем простой подход: заменяем "пробел + разделители + пробел" на один пробел
+        line = re.sub(r'\s[' + re.escape('|•-—–·▪▫') + r']+\s+', ' ', line)
+        # Удаляем множественные пробелы
+        line = re.sub(r'\s+', ' ', line)
+        
+        # Пропускаем строки, которые стали пустыми после очистки
+        if not line.strip():
+            continue
+        
+        cleaned_lines.append(line)
+    
+    # Объединяем строки обратно
+    result = '\n'.join(cleaned_lines)
+    
+    # Удаляем множественные переносы строк (более 2 подряд)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    
+    # Удаляем пробелы в начале и конце всего текста
+    result = result.strip()
+    
+    return result
+
+
+def remove_subscription_prompts(text):
+    """
+    Удаляет призывы к подписке в конце поста:
+    - "Подписывайтесь на нас"
+    - "в 👉"
+    - "Подписаться на ... в"
+    - "Мы в 👉"
+    """
+    if not text:
+        return text
+    
+    lines = text.split('\n')
+    
+    # Паттерны для удаления призывов к подписке
+    subscription_patterns = [
+        r'^🛑?\s*[Пп]одписывайтесь\s+на\s+нас',
+        r'^📲?\s*[Пп]одписаться\s+на\s+[^в]*\s+в\s*$',
+        r'^📱?\s*[Мм]ы\s+в\s*👉\s*$',
+        r'^в\s*👉\s*$',
+        r'^👉\s*$',
+        r'^📲\s*[Пп]одписаться',
+        r'^📱\s*[Мм]ы\s+в',
+        r'^🛑\s*[Пп]одписывайтесь',
+    ]
+    
+    # Удаляем строки с призывами к подписке с конца
+    # Идем с конца и удаляем призывы к подписке, пока не встретим обычную строку
+    cleaned_lines = []
+    i = len(lines) - 1
+    
+    while i >= 0:
+        line = lines[i].strip()
+        
+        # Пропускаем пустые строки в конце
+        if not line:
+            i -= 1
+            continue
+        
+        # Проверяем, является ли строка призывом к подписке
+        is_subscription = False
+        for pattern in subscription_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                is_subscription = True
+                break
+        
+        if is_subscription:
+            # Это призыв к подписке - пропускаем его
+            i -= 1
+        else:
+            # Это обычная строка - останавливаемся и возвращаем все до этого места
+            cleaned_lines = lines[:i+1]
+            break
+    
+    # Если все строки были призывами к подписке, возвращаем пустой текст
+    if not cleaned_lines:
+        return ""
+    
+    return '\n'.join(cleaned_lines).strip()
 
 
 async def resolve_target_entity():
@@ -298,83 +530,140 @@ async def process_message(entity, msg):
     logger.info("      Общая оценка: %.3f | %s", max_score, "СПАМ" if is_spam else "ОК")
     logger.info("=" * 60)
 
-    if not TARGET_ENTITY:
+    # Если пост определен как спам - не постим его
+    if is_spam:
+        logger.info("Пропуск сообщения %s/%s: определено как СПАМ", channel, msg.id)
         return
 
-    # пересылаем оригинал
-    await client.forward_messages(
-        TARGET_ENTITY,
-        msg,
-        from_peer=entity
-    )
-
-    # кнопка "Открыть пост"
-    buttons = None
+    # Получаем entities сообщения для удаления ссылок
+    entities = msg.entities or []
+    
+    # Удаляем все гиперссылки из текста
+    cleaned_text = remove_hyperlinks(text, entities)
+    
+    # Очищаем артефакты (одиночные разделители, пустые строки и т.д.)
+    cleaned_text = clean_text_artifacts(cleaned_text)
+    
+    # Удаляем призывы к подписке в конце поста
+    cleaned_text = remove_subscription_prompts(cleaned_text)
+    
+    # Добавляем в конец текст "Подписывайся" с ссылкой
+    subscribe_text = "Подписывайся"
+    subscribe_url = "https://t.me/+RpcJU9JMs9QwNTFi"
+    
+    # Формируем ссылку на источник (канал)
+    source_text = "Источник"
     if entity.username:
-        url = f"https://t.me/{entity.username}/{msg.id}"
-        buttons = [Button.url("🔗 Открыть пост", url)]
-
-    flag = "⚠️ ВОЗМОЖНО СПАМ" if is_spam else "✅ок"
-    
-    # Формируем информацию о категориях
-    categories_info = []
-    category_emojis = {
-        "ads": "📢",
-        "crypto": "₿",
-        "scam": "⚠️",
-        "casino": "🎰"
-    }
-    
-    for category in ["ads", "crypto", "scam", "casino"]:
-        if final_predictions[category] == 1:
-            emoji = category_emojis.get(category, "•")
-            score = final_scores[category]
-            categories_info.append(f"{emoji} {category.upper()}: {score:.2f}")
-    
-    categories_text = "\n".join(categories_info) if categories_info else "Нет категорий"
-    
-    # Формируем информацию о методах
-    evaluations = []
-    
-    # 1. Эвристика
-    heuristic_spam_text = "🔴 СПАМ" if heuristic_result["is_spam"] else "🟢 НОРМ"
-    evaluations.append(
-        f"📊 Эвристика\n"
-        f"  {heuristic_spam_text} | score={heuristic_result['score']:.3f}"
-    )
-    
-    # 2. BERT
-    bert_spam_text = "🔴 СПАМ" if bert_result["is_spam"] else "🟢 НОРМ"
-    bert_reason = bert_result.get("reason", "")
-    if "fallback" in bert_reason or "error" in bert_reason:
-        evaluations.append(
-            f"🤖 BERT ({bert_reason[:30]})\n"
-            f"  {bert_spam_text} | score={bert_result['score']:.3f}"
-        )
+        source_url = f"https://t.me/{entity.username}"
     else:
-        evaluations.append(
-            f"🤖 BERT\n"
-            f"  {bert_spam_text} | score={bert_result['score']:.3f}"
-        )
+        # Если нет username, используем ID канала
+        # Для каналов/групп ID начинается с -100, нужно убрать префикс
+        channel_id = str(entity.id)
+        if channel_id.startswith('-100'):
+            channel_id = channel_id[4:]  # Убираем префикс -100
+        else:
+            channel_id = channel_id.lstrip('-')  # Убираем минус если есть
+        source_url = f"https://t.me/c/{channel_id}/{msg.id}"
     
-    evaluations_text = "\n\n".join(evaluations)
+    # Формируем финальный текст
+    if cleaned_text:
+        final_text = f"{cleaned_text}\n\n{subscribe_text}\n{source_text}"
+    else:
+        final_text = f"{subscribe_text}\n{source_text}"
     
-    # Подсчитываем количество активных методов
-    active_methods_count = 2  # Эвристика и BERT
+    # Создаем entities для ссылок (используем UTF-16 offsets)
+    formatting_entities = []
     
-    message_text = (
-        f"{flag}\n\n"
-        f"📊 РЕЗУЛЬТАТЫ КЛАССИФИКАЦИИ ({active_methods_count} методов):\n\n"
-        f"{evaluations_text}\n\n"
-        f"🏷️ КАТЕГОРИИ:\n{categories_text}\n\n"
-        f"📝 Исходный текст:\n{text[:200]}{'...' if len(text) > 200 else ''}"
+    # Entity для "Подписывайся"
+    subscribe_start_python = final_text.find(subscribe_text)
+    subscribe_start_utf16 = python_to_utf16_offset(final_text, subscribe_start_python)
+    subscribe_length_utf16 = utf16_len(subscribe_text)
+    subscribe_entity = MessageEntityTextUrl(
+        offset=subscribe_start_utf16,
+        length=subscribe_length_utf16,
+        url=subscribe_url
     )
+    formatting_entities.append(subscribe_entity)
     
-    await client.send_message(
-        TARGET_ENTITY,
-        message_text,
-        buttons=buttons
+    # Entity для "Источник"
+    source_start_python = final_text.find(source_text)
+    source_start_utf16 = python_to_utf16_offset(final_text, source_start_python)
+    source_length_utf16 = utf16_len(source_text)
+    source_entity = MessageEntityTextUrl(
+        offset=source_start_utf16,
+        length=source_length_utf16,
+        url=source_url
     )
+    formatting_entities.append(source_entity)
+    
+    # Отправляем как новое сообщение в группу с форматированием и медиа
+    try:
+        target_group = await client.get_entity(TARGET_GROUP_ID)
+        
+        MAX_MEDIA_CAPTION_LENGTH = 1024
+        
+        # Проверяем, можно ли отправить медиа как файл
+        has_sendable_media = msg.media and can_send_as_file(msg.media)
+        
+        # Если есть отправляемое медиа и текст слишком длинный для подписи
+        if has_sendable_media and len(final_text) > MAX_MEDIA_CAPTION_LENGTH:
+            # Отправляем медиа с короткой подписью (только "Подписывайся" и "Источник")
+            short_caption = f"{subscribe_text}\n{source_text}"
+            
+            # Создаем entities для короткой подписи
+            short_formatting_entities = []
+            subscribe_start_python = short_caption.find(subscribe_text)
+            subscribe_start_utf16 = python_to_utf16_offset(short_caption, subscribe_start_python)
+            subscribe_length_utf16 = utf16_len(subscribe_text)
+            subscribe_entity = MessageEntityTextUrl(
+                offset=subscribe_start_utf16,
+                length=subscribe_length_utf16,
+                url=subscribe_url
+            )
+            short_formatting_entities.append(subscribe_entity)
+            
+            source_start_python = short_caption.find(source_text)
+            source_start_utf16 = python_to_utf16_offset(short_caption, source_start_python)
+            source_length_utf16 = utf16_len(source_text)
+            source_entity = MessageEntityTextUrl(
+                offset=source_start_utf16,
+                length=source_length_utf16,
+                url=source_url
+            )
+            short_formatting_entities.append(source_entity)
+            
+            # Отправляем медиа с короткой подписью
+            await client.send_message(
+                target_group,
+                short_caption,
+                file=msg.media,
+                formatting_entities=short_formatting_entities
+            )
+            
+            # Отправляем полный текст отдельным сообщением
+            await client.send_message(
+                target_group,
+                final_text,
+                formatting_entities=formatting_entities
+            )
+            
+            logger.info("Медиа отправлено с короткой подписью, полный текст отправлен отдельным сообщением")
+        else:
+            # Обычная отправка: текст + медиа (если есть и можно отправить) в одном сообщении
+            send_kwargs = {
+                'entity': target_group,
+                'message': final_text,
+                'formatting_entities': formatting_entities
+            }
+            
+            # Добавляем медиа, если оно есть и можно отправить как файл
+            if has_sendable_media:
+                send_kwargs['file'] = msg.media
+            
+            await client.send_message(**send_kwargs)
+            logger.info("Сообщение отправлено в группу %s (с медиа: %s)", TARGET_GROUP_ID, "да" if has_sendable_media else "нет")
+    except Exception as e:
+        logger.exception("Ошибка при отправке сообщения в группу %s: %s", TARGET_GROUP_ID, e)
 
 
 async def worker():

@@ -25,12 +25,39 @@ except Exception:
     QWEN_MODEL = 'Qwen3-8B-Q4_K_M.gguf'  # Fallback модель
 
 bert_classifier = None
+bert_is_trained = False  # Флаг, что модель обучена
 llm_generator = None
 
 if HAS_TRANSFORMERS and USE_RUBERT:
     try:
         bert_classifier = pipeline('text-classification', model=RUBERT_MODEL)
         logger.info('Loaded bert classifier: %s', RUBERT_MODEL)
+        
+        # Проверяем, обучена ли модель, делая тестовый запрос
+        # Если модель не обучена, score будет около 0.5 для всех текстов
+        try:
+            test_result = bert_classifier("тест")
+            if isinstance(test_result, list) and len(test_result) > 0:
+                test_score = test_result[0].get('score', 0.0)
+                # Если score сильно отличается от 0.5, модель может быть обучена
+                # Но для надежности лучше проверить на нескольких примерах
+                test_result2 = bert_classifier("реклама скидка купить")
+                if isinstance(test_result2, list) and len(test_result2) > 0:
+                    test_score2 = test_result2[0].get('score', 0.0)
+                    # Если оба результата около 0.5, модель скорее всего не обучена
+                    if abs(test_score - 0.5) < 0.1 and abs(test_score2 - 0.5) < 0.1:
+                        logger.warning(
+                            'BERT модель %s не обучена на классификации спама. '
+                            'Все предсказания будут около 0.5. BERT будет пропущен.',
+                            RUBERT_MODEL
+                        )
+                        bert_is_trained = False
+                    else:
+                        bert_is_trained = True
+                        logger.info('BERT модель обучена, будет использоваться для классификации')
+        except Exception:
+            logger.warning('Не удалось проверить обученность BERT модели, предполагаем что не обучена')
+            bert_is_trained = False
     except Exception:
         logger.exception('Не удалось загрузить BERT-классификатор')
 
@@ -83,19 +110,50 @@ def classify_text(text: str) -> dict:
     if score <= 1:
         return {"is_spam": False, "score": score, "reason": "heuristic_low"}
 
-    # 2️⃣ Если есть BERT — используем его
-    if bert_classifier:
+    # 2️⃣ Если есть BERT и он обучен — используем его
+    if bert_classifier and bert_is_trained:
         try:
             res = bert_classifier(text[:512])
             if isinstance(res, list) and len(res) > 0:
                 lab = res[0]
-                label = lab.get('label')
+                label = str(lab.get('label', '')).lower()
                 sc = lab.get('score', 0.0)
-                # Здесь я предполагаю, что модель помечает спам как LABEL_1 или содержит 'spam' в label.
-                is_spam = sc > 0.75 and ('spam' in str(label).lower() or 'label_1' in str(label).lower())
-                return {'is_spam': bool(is_spam), 'score': float(sc), 'reason': 'bert'}
+                
+                # Логика для бинарной классификации:
+                # Если score близок к 0.5 (0.4-0.6), модель не уверена - пропускаем BERT
+                if 0.4 <= sc <= 0.6:
+                    logger.debug(f'BERT неуверен (score={sc:.3f}, label={label}), пропускаем')
+                    # Продолжаем к следующему методу
+                else:
+                    # Модель уверена - интерпретируем результат
+                    # LABEL_1 обычно означает спам, LABEL_0 - не спам
+                    is_spam_bert = False
+                    normalized_score = sc
+                    
+                    if 'label_1' in label or 'spam' in label:
+                        # LABEL_1 = спам
+                        is_spam_bert = (sc > 0.5)  # Если score > 0.5, считаем спамом
+                        normalized_score = sc
+                    elif 'label_0' in label or 'not_spam' in label or 'ham' in label:
+                        # LABEL_0 = не спам
+                        is_spam_bert = (sc < 0.5)  # Если score < 0.5, считаем спамом (инвертированная логика)
+                        normalized_score = 1.0 - sc  # Инвертируем score для консистентности
+                    else:
+                        # Неизвестный label - используем score напрямую
+                        is_spam_bert = (sc > 0.5)
+                        normalized_score = sc if is_spam_bert else (1.0 - sc)
+                    
+                    logger.debug(f'BERT результат: is_spam={is_spam_bert}, score={normalized_score:.3f}, label={label}, raw_score={sc:.3f}')
+                    return {
+                        'is_spam': bool(is_spam_bert),
+                        'score': float(normalized_score),
+                        'reason': 'bert'
+                    }
         except Exception:
             logger.exception('Ошибка при вызове BERT')
+    elif bert_classifier and not bert_is_trained:
+        # BERT загружен, но не обучен - пропускаем без логирования (чтобы не засорять логи)
+        pass
 
     # 3️⃣ LLM (Qwen GGUF через llama-cli) - только если доступен
     try:
