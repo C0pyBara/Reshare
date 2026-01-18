@@ -41,9 +41,9 @@ LABELS = ["ads", "crypto", "scam", "casino"]
 # Пороги по умолчанию
 DEFAULT_THRESHOLDS = {
     "ads": 0.4,
-    "crypto": 0.3,
-    "scam": 0.2,
-    "casino": 0.3
+    "crypto": 0.5,
+    "scam": 0.5,
+    "casino": 0.5
 }
 
 

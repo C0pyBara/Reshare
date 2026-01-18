@@ -5,7 +5,7 @@ import sys
 from asyncio import Queue
 from collections import deque
 
-from telethon import TelegramClient, Button
+from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.types import MessageEntityUrl, MessageEntityTextUrl, MessageMediaWebPage, MessageMediaEmpty
 
@@ -14,7 +14,6 @@ from config import (
     API_HASH,
     SESSION_NAME,
     CHANNELS,
-    TARGET_GROUP,
     CHECK_INTERVAL,
     WORKERS,
     QUEUE_MAXSIZE,
@@ -22,6 +21,7 @@ from config import (
 
 from classifier_multilabel import classify_multilabel
 from data_logger import log_message_for_ml
+from ner_duplicate_detector import get_ner_detector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,12 +41,12 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 message_queue = Queue(maxsize=QUEUE_MAXSIZE)
 last_ids = {}
-TARGET_ENTITY = None
 
 PROCESSED_CACHE_SIZE = 10_000
 processed_ids = deque(maxlen=PROCESSED_CACHE_SIZE)
 
 TARGET_GROUP_ID = -1003172147499  # ID группы для публикации
+SPAM_MONITOR_USER_ID = 534239907  # ID пользователя для мониторинга спама
 
 
 def can_send_as_file(media):
@@ -275,23 +275,6 @@ def remove_subscription_prompts(text):
         return ""
     
     return '\n'.join(cleaned_lines).strip()
-
-
-async def resolve_target_entity():
-    global TARGET_ENTITY
-    if not TARGET_GROUP:
-        logger.warning("TARGET_GROUP не задан")
-        return
-
-    try:
-        try:
-            TARGET_ENTITY = await client.get_entity(int(TARGET_GROUP))
-        except ValueError:
-            TARGET_ENTITY = await client.get_entity(TARGET_GROUP)
-
-        logger.info("TARGET_GROUP resolved: %s", TARGET_ENTITY.id)
-    except Exception:
-        logger.exception("Не удалось разрешить TARGET_GROUP")
 
 
 async def initialize_channel_last_id(entity):
@@ -530,9 +513,71 @@ async def process_message(entity, msg):
     logger.info("      Общая оценка: %.3f | %s", max_score, "СПАМ" if is_spam else "ОК")
     logger.info("=" * 60)
 
-    # Если пост определен как спам - не постим его
+    # Если пост определен как спам - не постим его, но отправляем в личку для мониторинга
     if is_spam:
         logger.info("Пропуск сообщения %s/%s: определено как СПАМ", channel, msg.id)
+        
+        # Отправляем спам в личку для мониторинга
+        try:
+            monitor_user = await client.get_entity(SPAM_MONITOR_USER_ID)
+            
+            # Формируем сообщение с информацией о классификации
+            spam_info_lines = [
+                f"🚫 СПАМ обнаружен",
+                f"",
+                f"Канал: {channel}",
+                f"ID сообщения: {msg.id}",
+                f"",
+                f"Итоговые оценки:",
+                f"  • ads: {final_scores['ads']:.3f} ({'ДА' if final_predictions['ads'] else 'НЕТ'})",
+                f"  • crypto: {final_scores['crypto']:.3f} ({'ДА' if final_predictions['crypto'] else 'НЕТ'})",
+                f"  • scam: {final_scores['scam']:.3f} ({'ДА' if final_predictions['scam'] else 'НЕТ'})",
+                f"  • casino: {final_scores['casino']:.3f} ({'ДА' if final_predictions['casino'] else 'НЕТ'})",
+                f"",
+                f"Общая оценка: {max_score:.3f}",
+                f"",
+                f"Оригинальный текст:",
+                f"─" * 40,
+            ]
+            
+            spam_info_text = "\n".join(spam_info_lines)
+            full_message = f"{spam_info_text}\n{text}"
+            
+            # Отправляем текст (если он слишком длинный, разбиваем на части)
+            MAX_MESSAGE_LENGTH = 4096
+            if len(full_message) <= MAX_MESSAGE_LENGTH:
+                # Отправляем медиа отдельно, если оно есть и можно отправить
+                if msg.media and can_send_as_file(msg.media):
+                    # Отправляем медиа с текстом
+                    await client.send_message(
+                        monitor_user,
+                        full_message,
+                        file=msg.media
+                    )
+                else:
+                    # Отправляем только текст
+                    await client.send_message(monitor_user, full_message)
+            else:
+                # Текст слишком длинный - отправляем информацию отдельно, затем текст
+                await client.send_message(monitor_user, spam_info_text)
+                # Отправляем текст частями
+                text_part = f"Текст сообщения:\n{'─' * 40}\n{text}"
+                if len(text_part) > MAX_MESSAGE_LENGTH:
+                    # Разбиваем текст на части
+                    chunks = [text[i:i+MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+                    for i, chunk in enumerate(chunks, 1):
+                        await client.send_message(monitor_user, f"[Часть {i}/{len(chunks)}]\n{chunk}")
+                else:
+                    await client.send_message(monitor_user, text_part)
+                
+                # Отправляем медиа отдельно, если есть
+                if msg.media and can_send_as_file(msg.media):
+                    await client.send_message(monitor_user, file=msg.media)
+            
+            logger.info("Спам-сообщение отправлено в личку для мониторинга (ID: %s)", SPAM_MONITOR_USER_ID)
+        except Exception as e:
+            logger.exception("Ошибка при отправке спама в личку для мониторинга: %s", e)
+        
         return
 
     # Получаем entities сообщения для удаления ссылок
@@ -546,6 +591,28 @@ async def process_message(entity, msg):
     
     # Удаляем призывы к подписке в конце поста
     cleaned_text = remove_subscription_prompts(cleaned_text)
+    
+    # Проверка на дубликаты через NER
+    try:
+        ner_detector = get_ner_detector(ttl_hours=4, similarity_threshold=0.85)
+        is_duplicate, similarity_score, duplicate_msg_id = ner_detector.is_duplicate(
+            cleaned_text, entity.id, msg.id, media=msg.media
+        )
+        
+        if is_duplicate:
+            logger.info(
+                "Пропуск сообщения %s/%s: обнаружен дубликат (similarity=%.2f, дубликат: %s/%s)",
+                channel, msg.id, similarity_score, channel, duplicate_msg_id
+            )
+            return
+        elif similarity_score > 0:
+            logger.debug(
+                "Сообщение %s/%s не является дубликатом (similarity=%.2f)",
+                channel, msg.id, similarity_score
+            )
+    except Exception as e:
+        logger.exception("Ошибка при проверке на дубликаты: %s", e)
+        # Продолжаем обработку, если NER не работает
     
     # Добавляем в конец текст "Подписывайся" с ссылкой
     subscribe_text = "Подписывайся"
@@ -571,30 +638,19 @@ async def process_message(entity, msg):
     else:
         final_text = f"{subscribe_text}\n{source_text}"
     
-    # Создаем entities для ссылок (используем UTF-16 offsets)
-    formatting_entities = []
+    # Функция-хелпер для создания entity ссылки
+    def create_text_url_entity(text, link_text, url):
+        """Создает MessageEntityTextUrl для ссылки в тексте."""
+        start_python = text.find(link_text)
+        start_utf16 = python_to_utf16_offset(text, start_python)
+        length_utf16 = utf16_len(link_text)
+        return MessageEntityTextUrl(offset=start_utf16, length=length_utf16, url=url)
     
-    # Entity для "Подписывайся"
-    subscribe_start_python = final_text.find(subscribe_text)
-    subscribe_start_utf16 = python_to_utf16_offset(final_text, subscribe_start_python)
-    subscribe_length_utf16 = utf16_len(subscribe_text)
-    subscribe_entity = MessageEntityTextUrl(
-        offset=subscribe_start_utf16,
-        length=subscribe_length_utf16,
-        url=subscribe_url
-    )
-    formatting_entities.append(subscribe_entity)
-    
-    # Entity для "Источник"
-    source_start_python = final_text.find(source_text)
-    source_start_utf16 = python_to_utf16_offset(final_text, source_start_python)
-    source_length_utf16 = utf16_len(source_text)
-    source_entity = MessageEntityTextUrl(
-        offset=source_start_utf16,
-        length=source_length_utf16,
-        url=source_url
-    )
-    formatting_entities.append(source_entity)
+    # Создаем entities для ссылок
+    formatting_entities = [
+        create_text_url_entity(final_text, subscribe_text, subscribe_url),
+        create_text_url_entity(final_text, source_text, source_url),
+    ]
     
     # Отправляем как новое сообщение в группу с форматированием и медиа
     try:
@@ -609,28 +665,10 @@ async def process_message(entity, msg):
         if has_sendable_media and len(final_text) > MAX_MEDIA_CAPTION_LENGTH:
             # Отправляем медиа с короткой подписью (только "Подписывайся" и "Источник")
             short_caption = f"{subscribe_text}\n{source_text}"
-            
-            # Создаем entities для короткой подписи
-            short_formatting_entities = []
-            subscribe_start_python = short_caption.find(subscribe_text)
-            subscribe_start_utf16 = python_to_utf16_offset(short_caption, subscribe_start_python)
-            subscribe_length_utf16 = utf16_len(subscribe_text)
-            subscribe_entity = MessageEntityTextUrl(
-                offset=subscribe_start_utf16,
-                length=subscribe_length_utf16,
-                url=subscribe_url
-            )
-            short_formatting_entities.append(subscribe_entity)
-            
-            source_start_python = short_caption.find(source_text)
-            source_start_utf16 = python_to_utf16_offset(short_caption, source_start_python)
-            source_length_utf16 = utf16_len(source_text)
-            source_entity = MessageEntityTextUrl(
-                offset=source_start_utf16,
-                length=source_length_utf16,
-                url=source_url
-            )
-            short_formatting_entities.append(source_entity)
+            short_formatting_entities = [
+                create_text_url_entity(short_caption, subscribe_text, subscribe_url),
+                create_text_url_entity(short_caption, source_text, source_url),
+            ]
             
             # Отправляем медиа с короткой подписью
             await client.send_message(
@@ -680,8 +718,6 @@ async def worker():
 async def main():
     await client.start()
     logger.info("Бот запущен")
-    
-    await resolve_target_entity()
     
     # Запускаем воркеры
     workers = [asyncio.create_task(worker()) for _ in range(WORKERS)]
